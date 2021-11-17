@@ -2,3 +2,5 @@
 /build-*
 /.vscode
 *.so
+.cache/
+compile_commands.json

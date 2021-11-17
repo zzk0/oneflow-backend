@@ -43,6 +43,7 @@ limitations under the License.
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <ostream>
 #include <thread>
 #include "triton/backend/backend_common.h"
 #include "triton/backend/backend_model.h"
@@ -363,6 +364,7 @@ TRITONBACKEND_Initialize(TRITONBACKEND_Backend* backend)
   RETURN_IF_ERROR(TRITONBACKEND_BackendName(backend, &cname));
   std::string name(cname);
 
+  std::cout << "OneFlow Backend Initialized" << std::endl;
   LOG_MESSAGE(
       TRITONSERVER_LOG_INFO,
       (std::string("TRITONBACKEND_Initialize: ") + name).c_str());
