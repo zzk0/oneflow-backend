@@ -56,3 +56,6 @@ cmake -DCMAKE_INSTALL_PREFIX:PATH=`pwd`/install  -DTRITON_BACKEND_REPO_TAG=r21.1
 ninja
 ```
 
+## Model Repository
+
+The Model Repository Examples is located here: `docs/examples/model_repository`
