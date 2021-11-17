@@ -49,3 +49,10 @@ Developing OneFlow Backend For Triton Inference Server
 ## Build
 
 
+```
+mkdir build
+cd build
+cmake -DCMAKE_INSTALL_PREFIX:PATH=`pwd`/install  -DTRITON_BACKEND_REPO_TAG=r21.10 -DTRITON_CORE_REPO_TAG=r21.10 -DTRITON_COMMON_REPO_TAG=r21.10 -G Ninja ..
+ninja
+```
+
