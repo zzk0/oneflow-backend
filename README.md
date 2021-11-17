@@ -58,4 +58,4 @@ ninja
 
 ## Model Repository
 
-The Model Repository Examples is located here: `docs/examples/model_repository`
+The Model Examples are located here: `docs/examples/model_repository`
