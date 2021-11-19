@@ -89,6 +89,7 @@ FetchContent_Declare(
   GIT_SHALLOW ON
 )
 FetchContent_MakeAvailable(repo-common repo-core repo-backend)
+find_package(oneflow)
 
 #
 # Shared library implementing the Triton Backend API
@@ -125,6 +126,7 @@ target_link_libraries(
     triton-core-backendapi  # from repo-core
     triton-core-serverstub  # from repo-core
     triton-backend-utils    # from repo-backend
+    OneFlow::liboneflow
 )
 
 if(WIN32)

@@ -54,7 +54,7 @@ limitations under the License.
 #include <cuda_runtime_api.h>
 #endif  // TRITON_ENABLE_GPU
 
-namespace triton { namespace backend { namespace identity {
+namespace triton { namespace backend { namespace oneflow_api {
 
 //
 // Simple backend that demonstrates the TRITONBACKEND API for a blocking
@@ -1053,4 +1053,4 @@ TRITONBACKEND_ModelInstanceExecute(
 
 }  // extern "C"
 
-}}}  // namespace triton::backend::identity
+}}}  // namespace triton::backend::oneflow_api
