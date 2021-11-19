@@ -126,6 +126,7 @@ target_link_libraries(
     triton-core-backendapi  # from repo-core
     triton-core-serverstub  # from repo-core
     triton-backend-utils    # from repo-backend
+  PUBLIC
     OneFlow::liboneflow
 )
 

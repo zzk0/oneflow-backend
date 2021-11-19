@@ -40,11 +40,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#include <oneflow/device.h>
+#include <oneflow/env.h>
+#include <oneflow/graph.h>
+
 #include <algorithm>
 #include <map>
 #include <memory>
 #include <ostream>
 #include <thread>
+
+#include "oneflow/api.h"
+#include "oneflow_utils.h"
 #include "triton/backend/backend_common.h"
 #include "triton/backend/backend_model.h"
 #include "triton/backend/backend_model_instance.h"
@@ -54,7 +61,7 @@ limitations under the License.
 #include <cuda_runtime_api.h>
 #endif  // TRITON_ENABLE_GPU
 
-namespace triton { namespace backend { namespace oneflow_api {
+namespace triton { namespace backend { namespace oneflow {
 
 //
 // Simple backend that demonstrates the TRITONBACKEND API for a blocking
@@ -96,26 +103,12 @@ class ModelState : public BackendModel {
       TRITONBACKEND_Model* triton_model, ModelState** state);
   virtual ~ModelState() = default;
 
-  // Get execution delay and delay multiplier
-  uint64_t ExecDelay() const { return execute_delay_ms_; }
-  uint64_t DelayMultiplier() const { return delay_multiplier_; }
-
-  // Stores the instance count
-  size_t instance_count_;
-
   // Validate that model configuration is supported by this backend.
   TRITONSERVER_Error* ValidateModelConfig();
 
-  // Block the thread for seconds specified in 'creation_delay_sec' parameter.
-  // This function is used for testing.
-  TRITONSERVER_Error* CreationDelay();
-
  private:
   ModelState(TRITONBACKEND_Model* triton_model);
-
-  // Delay time and multiplier to introduce into execution, in milliseconds.
-  int execute_delay_ms_;
-  int delay_multiplier_;
+  XrtKind xrt_kind;
 };
 
 TRITONSERVER_Error*
@@ -135,54 +128,16 @@ ModelState::Create(TRITONBACKEND_Model* triton_model, ModelState** state)
 }
 
 ModelState::ModelState(TRITONBACKEND_Model* triton_model)
-    : BackendModel(triton_model), instance_count_(0), execute_delay_ms_(0),
-      delay_multiplier_(0)
+    : BackendModel(triton_model), xrt_kind(XrtKind::kOneflow)
 {
-}
-
-TRITONSERVER_Error*
-ModelState::CreationDelay()
-{
-  // Feature for testing purpose...
-  // look for parameter 'creation_delay_sec' in model config
-  // and sleep for the value specified
-  common::TritonJson::Value parameters;
-  if (model_config_.Find("parameters", &parameters)) {
-    common::TritonJson::Value creation_delay_sec;
-    if (parameters.Find("creation_delay_sec", &creation_delay_sec)) {
-      std::string creation_delay_sec_str;
-      RETURN_IF_ERROR(creation_delay_sec.MemberAsString(
-          "string_value", &creation_delay_sec_str));
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_INFO,
-          (std::string("Creation delay is set to: ") + creation_delay_sec_str)
-              .c_str());
-      std::this_thread::sleep_for(
-          std::chrono::seconds(std::stoi(creation_delay_sec_str)));
-    }
-  }
-
-  return nullptr;  // success
 }
 
 TRITONSERVER_Error*
 ModelState::ValidateModelConfig()
 {
-  // We have the json DOM for the model configuration...
-  common::TritonJson::WriteBuffer buffer;
-  RETURN_IF_ERROR(model_config_.PrettyWrite(&buffer));
-  LOG_MESSAGE(
-      TRITONSERVER_LOG_INFO,
-      (std::string("model configuration:\n") + buffer.Contents()).c_str());
-
   common::TritonJson::Value inputs, outputs;
   RETURN_IF_ERROR(model_config_.MemberAsArray("input", &inputs));
   RETURN_IF_ERROR(model_config_.MemberAsArray("output", &outputs));
-
-  // There must be equal number of inputs and outputs.
-  RETURN_ERROR_IF_FALSE(
-      inputs.ArraySize() == outputs.ArraySize(), TRITONSERVER_ERROR_INVALID_ARG,
-      std::string("model configuration must have equal input/output pairs"));
 
   // Collect input/output names, shapes and datatypes
   std::map<std::string, std::tuple<std::string, std::vector<int64_t>>>
@@ -192,7 +147,6 @@ ModelState::ValidateModelConfig()
     RETURN_IF_ERROR(inputs.IndexAsObject(io_index, &input));
     RETURN_IF_ERROR(outputs.IndexAsObject(io_index, &output));
 
-    // Input and output names must follow INPUT/OUTPUT<index> pattern
     const char* input_name;
     size_t input_name_len;
     RETURN_IF_ERROR(input.MemberAsString("name", &input_name, &input_name_len));
@@ -203,18 +157,7 @@ ModelState::ValidateModelConfig()
         output.MemberAsString("name", &output_name, &output_name_len));
 
     std::string input_name_str = std::string(input_name);
-    RETURN_ERROR_IF_FALSE(
-        input_name_str.rfind("INPUT", 0) == 0, TRITONSERVER_ERROR_INVALID_ARG,
-        std::string(
-            "expected input name to follow INPUT<index> pattern, got '") +
-            input_name + "'");
-
     std::string output_name_str = std::string(output_name);
-    RETURN_ERROR_IF_FALSE(
-        output_name_str.rfind("OUTPUT", 0) == 0, TRITONSERVER_ERROR_INVALID_ARG,
-        std::string(
-            "expected output name to follow OUTPUT<index> pattern, got '") +
-            output_name + "'");
 
     // Input and output must have same datatype
     std::string input_dtype, output_dtype;
@@ -237,56 +180,25 @@ ModelState::ValidateModelConfig()
     }
 
     input_infos.insert(std::make_pair(
-        input_name_str.substr(strlen("INPUT")),
-        std::make_tuple(input_dtype, input_shape)));
+        input_name_str, std::make_tuple(input_dtype, input_shape)));
     output_infos.insert(std::make_pair(
-        output_name_str.substr(strlen("OUTPUT")),
-        std::make_tuple(output_dtype, output_shape)));
-  }
-
-  // Must validate name, shape and datatype with corresponding input
-  for (auto it = output_infos.begin(); it != output_infos.end(); ++it) {
-    std::string output_index = it->first;
-    auto input_it = input_infos.find(output_index);
-
-    RETURN_ERROR_IF_FALSE(
-        input_it != input_infos.end(), TRITONSERVER_ERROR_INVALID_ARG,
-        std::string("expected input and output indices to match"));
-
-    RETURN_ERROR_IF_FALSE(
-        std::get<0>(input_it->second) == std::get<0>(it->second),
-        TRITONSERVER_ERROR_INVALID_ARG,
-        std::string("expected input and output datatype to match, got ") +
-            std::get<0>(input_it->second) + " and " + std::get<0>(it->second));
-
-    RETURN_ERROR_IF_FALSE(
-        std::get<1>(input_it->second) == std::get<1>(it->second),
-        TRITONSERVER_ERROR_INVALID_ARG,
-        std::string("expected input and output shape to match, got ") +
-            backend::ShapeToString(std::get<1>(input_it->second)) + " and " +
-            backend::ShapeToString(std::get<1>(it->second)));
+        output_name_str, std::make_tuple(output_dtype, output_shape)));
   }
 
   triton::common::TritonJson::Value params;
+  bool is_unknown = true;
   if (model_config_.Find("parameters", &params)) {
-    common::TritonJson::Value exec_delay;
-    if (params.Find("execute_delay_ms", &exec_delay)) {
-      std::string exec_delay_str;
-      RETURN_IF_ERROR(
-          exec_delay.MemberAsString("string_value", &exec_delay_str));
-      execute_delay_ms_ = std::stoi(exec_delay_str);
-
-      // Apply delay multiplier based on instance index, this is not taking
-      // multiple devices into consideration, so the behavior is best controlled
-      // in single device case.
-      common::TritonJson::Value delay_multiplier;
-      if (params.Find("instance_wise_delay_multiplier", &delay_multiplier)) {
-        std::string delay_multiplier_str;
-        RETURN_IF_ERROR(delay_multiplier.MemberAsString(
-            "string_value", &delay_multiplier_str));
-        delay_multiplier_ = std::stoi(delay_multiplier_str);
-      }
+    common::TritonJson::Value xrt;
+    if (params.Find("xrt", &xrt)) {
+      std::string xrt_str;
+      RETURN_IF_ERROR(xrt.MemberAsString("string_value", &xrt_str));
+      this->xrt_kind = ParseXrtKind(xrt_str, &is_unknown);
     }
+  }
+  if (is_unknown) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_INFO,
+        "xrt tag is unknown, oneflow runtime will be used");
   }
 
   return nullptr;  // success
@@ -309,17 +221,12 @@ class ModelInstanceState : public BackendModelInstance {
   // Get the state of the model that corresponds to this instance.
   ModelState* StateForModel() const { return model_state_; }
 
-  // Get the instance ID of the instance.
-  size_t InstanceId() const { return instance_id_; }
-
  private:
   ModelInstanceState(
       ModelState* model_state,
-      TRITONBACKEND_ModelInstance* triton_model_instance,
-      const size_t instance_id);
+      TRITONBACKEND_ModelInstance* triton_model_instance);
 
   ModelState* model_state_;
-  const size_t instance_id_;
 };
 
 TRITONSERVER_Error*
@@ -329,7 +236,7 @@ ModelInstanceState::Create(
 {
   try {
     *state = new ModelInstanceState(
-        model_state, triton_model_instance, model_state->instance_count_);
+        model_state, triton_model_instance);
   }
   catch (const BackendModelInstanceException& ex) {
     RETURN_ERROR_IF_TRUE(
@@ -338,15 +245,13 @@ ModelInstanceState::Create(
     RETURN_IF_ERROR(ex.err_);
   }
 
-  model_state->instance_count_++;
   return nullptr;  // success
 }
 
 ModelInstanceState::ModelInstanceState(
-    ModelState* model_state, TRITONBACKEND_ModelInstance* triton_model_instance,
-    const size_t instance_id)
+    ModelState* model_state, TRITONBACKEND_ModelInstance* triton_model_instance)
     : BackendModelInstance(model_state, triton_model_instance),
-      model_state_(model_state), instance_id_(instance_id)
+      model_state_(model_state)
 {
 }
 
@@ -364,7 +269,7 @@ TRITONBACKEND_Initialize(TRITONBACKEND_Backend* backend)
   RETURN_IF_ERROR(TRITONBACKEND_BackendName(backend, &cname));
   std::string name(cname);
 
-  std::cout << "OneFlow Backend Initialized" << std::endl;
+  oneflow_api::initialize();
   LOG_MESSAGE(
       TRITONSERVER_LOG_INFO,
       (std::string("TRITONBACKEND_Initialize: ") + name).c_str());
@@ -395,28 +300,6 @@ TRITONBACKEND_Initialize(TRITONBACKEND_Backend* backend)
         "triton backend API version does not support this backend");
   }
 
-  // The backend configuration may contain information needed by the
-  // backend, such a command-line arguments. This backend doesn't use
-  // any such configuration but we print whatever is available.
-  TRITONSERVER_Message* backend_config_message;
-  RETURN_IF_ERROR(
-      TRITONBACKEND_BackendConfig(backend, &backend_config_message));
-
-  const char* buffer;
-  size_t byte_size;
-  RETURN_IF_ERROR(TRITONSERVER_MessageSerializeToJson(
-      backend_config_message, &buffer, &byte_size));
-  LOG_MESSAGE(
-      TRITONSERVER_LOG_INFO,
-      (std::string("backend configuration:\n") + buffer).c_str());
-
-  // If we have any global backend state we create and set it here. We
-  // don't need anything for this backend but for demonstration
-  // purposes we just create something...
-  std::string* state = new std::string("backend state");
-  RETURN_IF_ERROR(
-      TRITONBACKEND_BackendSetState(backend, reinterpret_cast<void*>(state)));
-
   return nullptr;  // success
 }
 
@@ -426,16 +309,15 @@ TRITONBACKEND_Initialize(TRITONBACKEND_Backend* backend)
 TRITONBACKEND_ISPEC TRITONSERVER_Error*
 TRITONBACKEND_Finalize(TRITONBACKEND_Backend* backend)
 {
-  void* vstate;
-  RETURN_IF_ERROR(TRITONBACKEND_BackendState(backend, &vstate));
-  std::string* state = reinterpret_cast<std::string*>(vstate);
+  const char* cname;
+  RETURN_IF_ERROR(TRITONBACKEND_BackendName(backend, &cname));
+  std::string name(cname);
 
+  oneflow_api::release();
   LOG_MESSAGE(
       TRITONSERVER_LOG_INFO,
-      (std::string("TRITONBACKEND_Finalize: state is '") + *state + "'")
+      (std::string("TRITONBACKEND_Finalize: ") + name)
           .c_str());
-
-  delete state;
 
   return nullptr;  // success
 }
@@ -459,46 +341,13 @@ TRITONBACKEND_ModelInitialize(TRITONBACKEND_Model* model)
        std::to_string(version) + ")")
           .c_str());
 
-  // Can get location of the model artifacts. Normally we would need
-  // to check the artifact type to make sure it was something we can
-  // handle... but we are just going to log the location so we don't
-  // need the check. We would use the location if we wanted to load
-  // something from the model's repo.
-  TRITONBACKEND_ArtifactType artifact_type;
-  const char* clocation;
-  RETURN_IF_ERROR(
-      TRITONBACKEND_ModelRepository(model, &artifact_type, &clocation));
-  LOG_MESSAGE(
-      TRITONSERVER_LOG_INFO,
-      (std::string("Repository location: ") + clocation).c_str());
-
-  // The model can access the backend as well... here we can access
-  // the backend global state.
-  TRITONBACKEND_Backend* backend;
-  RETURN_IF_ERROR(TRITONBACKEND_ModelBackend(model, &backend));
-
-  void* vbackendstate;
-  RETURN_IF_ERROR(TRITONBACKEND_BackendState(backend, &vbackendstate));
-  std::string* backend_state = reinterpret_cast<std::string*>(vbackendstate);
-
-  LOG_MESSAGE(
-      TRITONSERVER_LOG_INFO,
-      (std::string("backend state is '") + *backend_state + "'").c_str());
-
   // Create a ModelState object and associate it with the TRITONBACKEND_Model.
   ModelState* model_state;
   RETURN_IF_ERROR(ModelState::Create(model, &model_state));
   RETURN_IF_ERROR(
       TRITONBACKEND_ModelSetState(model, reinterpret_cast<void*>(model_state)));
 
-  // One of the primary things to do in ModelInitialize is to examine
-  // the model configuration to ensure that it is something that this
-  // backend can support. If not, returning an error from this
-  // function will prevent the model from loading.
   RETURN_IF_ERROR(model_state->ValidateModelConfig());
-
-  // For testing.. Block the thread for certain time period before returning.
-  RETURN_IF_ERROR(model_state->CreationDelay());
 
   return nullptr;  // success
 }
@@ -536,11 +385,15 @@ TRITONBACKEND_ModelInstanceInitialize(TRITONBACKEND_ModelInstance* instance)
   TRITONSERVER_InstanceGroupKind kind;
   RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceKind(instance, &kind));
 
+  std::string device_tag = "cpu";
 #ifdef TRITON_ENABLE_GPU
   if (kind == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
-    cudaSetDevice(device_id);
+    // cudaSetDevice(device_id);
+    device_tag = "gpu";
   }
 #endif  // TRITON_ENABLE_GPU
+
+  oneflow_api::Device device(device_tag, device_id);
 
   LOG_MESSAGE(
       TRITONSERVER_LOG_INFO,
@@ -565,16 +418,6 @@ TRITONBACKEND_ModelInstanceInitialize(TRITONBACKEND_ModelInstance* instance)
       ModelInstanceState::Create(model_state, instance, &instance_state));
   RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceSetState(
       instance, reinterpret_cast<void*>(instance_state)));
-
-#ifndef TRITON_ENABLE_GPU
-  // Because this backend just copies IN -> OUT and requires that
-  // input and output be in CPU memory, we fail if a GPU instances is
-  // requested.
-  RETURN_ERROR_IF_FALSE(
-      instance_state->Kind() == TRITONSERVER_INSTANCEGROUPKIND_CPU,
-      TRITONSERVER_ERROR_INVALID_ARG,
-      std::string("'identity' backend only supports CPU instances"));
-#endif  // TRITON_ENABLE_GPU
 
   return nullptr;  // success
 }
@@ -683,16 +526,16 @@ TRITONBACKEND_ModelInstanceExecute(
   SET_TIMESTAMP(compute_start_ns);
 
   // Delay if requested...
-  if (model_state->ExecDelay() > 0) {
-    uint64_t multiplier = model_state->DelayMultiplier();
+  // if (model_state->ExecDelay() > 0) {
+  //   uint64_t multiplier = model_state->DelayMultiplier();
 
-    if (model_state->DelayMultiplier() > 0) {
-      multiplier *= instance_state->InstanceId();
-    }
-    uint64_t delay_ms =
-        model_state->ExecDelay() * std::max(multiplier, uint64_t(1));
-    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-  }
+  //   if (model_state->DelayMultiplier() > 0) {
+  //     multiplier *= instance_state->InstanceId();
+  //   }
+  //   uint64_t delay_ms =
+  //       model_state->ExecDelay() * std::max(multiplier, uint64_t(1));
+  //   std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+  // }
 
   // For simplicity we just process each request separately... in
   // general a backend should try to operate on the entire batch of
@@ -1053,4 +896,4 @@ TRITONBACKEND_ModelInstanceExecute(
 
 }  // extern "C"
 
-}}}  // namespace triton::backend::oneflow_api
+}}}  // namespace triton::backend::oneflow
